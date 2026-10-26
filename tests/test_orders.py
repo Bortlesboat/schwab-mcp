@@ -2561,3 +2561,71 @@ class TestEquityLegSymbols:
         assert orders._equity_leg_symbols({}) == []
         malformed = {"orderLegCollection": ["junk", {"instrument": "junk"}], "childOrderStrategies": ["junk"]}
         assert orders._equity_leg_symbols(malformed) == []
+
+
+class TestFractionalShareQuantity:
+    def test_equity_tools_accept_fractional_quantity_in_schema(self):
+        server = MCPServer(name="orders")
+        orders.register(server, allow_write=True)
+        tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
+
+        for name in ("preview_equity_order", "preview_equity_trailing_stop_order", "preview_bracket_order"):
+            args = tools[name].fn_metadata.arg_model.model_validate(
+                {
+                    "account_hash": "acc123",
+                    "symbol": "VTI",
+                    "quantity": 45.0498,
+                    "instruction": "SELL",
+                    "order_type": "MARKET",
+                    "trail_offset": 1.0,
+                    "entry_type": "MARKET",
+                    "entry_instruction": "SELL",
+                    "profit_price": 1.0,
+                    "loss_price": 1.0,
+                }
+            )
+            assert getattr(args, "quantity") == 45.0498, name
+
+        option_args = tools["preview_option_order"].fn_metadata.arg_model
+        with pytest.raises(ValueError):
+            option_args.model_validate(
+                {
+                    "account_hash": "acc123",
+                    "symbol": "SPY   251219C00500000",
+                    "quantity": 1.5,
+                    "instruction": "BUY_TO_OPEN",
+                    "order_type": "MARKET",
+                }
+            )
+
+    def test_fractional_equity_quantity_is_sent_unchanged(self):
+        spec = orders._prepare_equity_order("VTI", 45.0498, "SELL", "MARKET")
+        assert spec["orderLegCollection"][0]["quantity"] == 45.0498
+
+        whole = orders._prepare_equity_order("VTI", 45, "SELL", "MARKET")
+        assert whole["orderLegCollection"][0]["quantity"] == 45
+        assert isinstance(whole["orderLegCollection"][0]["quantity"], int)
+
+    def test_fractional_equity_leg_desc_is_accepted(self):
+        desc = {"symbol": "VTI", "quantity": 0.5, "instruction": "SELL", "order_type": "LIMIT", "price": 300.0}
+        spec = orders._build_order_from_desc(desc, "NORMAL", "DAY").build()
+        assert spec["orderLegCollection"][0]["quantity"] == 0.5
+
+    def test_fractional_option_leg_desc_is_rejected(self):
+        desc = {
+            "symbol": "SPY   251219C00500000",
+            "quantity": 1.5,
+            "instruction": "BUY_TO_OPEN",
+            "order_type": "MARKET",
+            "asset_type": "OPTION",
+        }
+        with pytest.raises(ValueError, match="quantity must be an integer for OPTION orders"):
+            orders._build_order_from_desc(desc, "NORMAL", "DAY")
+
+    @pytest.mark.parametrize("quantity", [float("nan"), float("inf")])
+    def test_non_finite_quantity_is_rejected(self, quantity):
+        with pytest.raises(ValueError, match="quantity must be a finite number"):
+            orders._prepare_equity_order("VTI", quantity, "SELL", "MARKET")
+        desc = {"symbol": "VTI", "quantity": quantity, "instruction": "SELL", "order_type": "MARKET"}
+        with pytest.raises(ValueError, match="quantity must be a finite number"):
+            orders._build_order_from_desc(desc, "NORMAL", "DAY")

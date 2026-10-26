@@ -1,6 +1,7 @@
 """Order placement, management, and preview tools for the Schwab MCP server."""
 
 import logging
+import math
 import re
 import uuid
 from collections.abc import Callable
@@ -323,15 +324,22 @@ def _format_order_price(price: float) -> str:
     return f"{truncated:.{decimal_places}f}"
 
 
+def _validate_share_quantity(quantity: int | float) -> None:
+    """Reject NaN and infinite share counts, which schwab-py's positive check lets through."""
+    if isinstance(quantity, float) and not math.isfinite(quantity):
+        raise ValueError(f"quantity must be a finite number, got {quantity!r}")
+
+
 def _build_equity_order_spec(
     symbol: str,
-    quantity: int,
+    quantity: int | float,
     instruction: str,
     order_type: str,
     price: float | None = None,
     stop_price: float | None = None,
 ):
     """Internal helper to build the core equity order spec builder based on parameters."""
+    _validate_share_quantity(quantity)
     instruction = instruction.upper()
     order_type = order_type.upper()
 
@@ -375,7 +383,7 @@ def _validate_equity_order_prices(
 def _build_trailing_stop_from_desc(
     desc: "OrderDesc",
     symbol: str,
-    quantity: int,
+    quantity: int | float,
     instruction: str,
     asset_type: str,
 ) -> Any:
@@ -391,11 +399,12 @@ def _build_trailing_stop_from_desc(
 
 def _build_trailing_stop_order_spec(
     symbol: str,
-    quantity: int,
+    quantity: int | float,
     instruction: str,
     trail_offset: float,
     trail_type: str = "VALUE",
 ):
+    _validate_share_quantity(quantity)
     instruction = instruction.upper()
     trail_type = trail_type.upper()
 
@@ -470,7 +479,7 @@ class _OrderDescInputRequired(TypedDict):
     """Required fields for an order leg description (TypedDict for MCP schema)."""
 
     symbol: str
-    quantity: int
+    quantity: int | float
     instruction: str
     order_type: str
 
@@ -510,7 +519,7 @@ class OrderDesc:
     """
 
     symbol: str
-    quantity: int
+    quantity: int | float
     instruction: str
     order_type: str
     price: float | None = None
@@ -546,16 +555,20 @@ class OrderDesc:
             if not isinstance(value, str):
                 raise ValueError(f"{field} must be a string, got {value!r}")
 
-        quantity = raw["quantity"]
-        if not isinstance(quantity, int) or isinstance(quantity, bool):
-            raise ValueError(f"quantity must be an integer, got {quantity!r}")
-
         raw_asset_type = raw.get("asset_type", "EQUITY")
         if not isinstance(raw_asset_type, str):
             raise ValueError(f"asset_type must be a string, got {raw_asset_type!r}")
         asset_type = raw_asset_type.upper()
         if asset_type not in ("EQUITY", "OPTION"):
             raise ValueError(f"Invalid asset_type: {asset_type}. Must be EQUITY or OPTION.")
+
+        # Equities may trade fractional shares; options trade whole contracts.
+        quantity = raw["quantity"]
+        if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
+            raise ValueError(f"quantity must be an integer (or a number for EQUITY), got {quantity!r}")
+        if asset_type == "OPTION" and not isinstance(quantity, int):
+            raise ValueError(f"quantity must be an integer for OPTION orders, got {quantity!r}")
+        _validate_share_quantity(quantity)
 
         for field in ("price", "stop_price", "trail_offset"):
             value = raw.get(field)
@@ -651,7 +664,7 @@ def _build_order_from_validated_desc(
     elif desc.asset_type == "OPTION":
         builder = _build_option_order_spec(
             desc.symbol,
-            desc.quantity,
+            cast(int, desc.quantity),  # from_dict only accepts whole contracts for OPTION
             desc.instruction,
             desc.order_type,
             price=desc.price,
@@ -731,7 +744,7 @@ async def _post_write_order_result(
 
 def _prepare_equity_order(
     symbol: str,
-    quantity: int,
+    quantity: int | float,
     instruction: str,
     order_type: str,
     price: float | None = None,
@@ -797,7 +810,7 @@ def _prepare_replacement_order(replacement_order: dict[str, Any]) -> tuple[dict[
 
 def _prepare_trailing_stop_order(
     symbol: str,
-    quantity: int,
+    quantity: int | float,
     instruction: str,
     trail_offset: float,
     trail_type: str | None = "VALUE",
@@ -855,7 +868,7 @@ def _prepare_trigger_order(
 
 def _prepare_bracket_order(
     symbol: str,
-    quantity: int,
+    quantity: int | float,
     entry_instruction: str,
     entry_type: str,
     profit_price: float | None = None,
@@ -930,7 +943,7 @@ def _prepare_option_combo_order(
 
 def _order_summary_equity(
     instruction: str,
-    quantity: int,
+    quantity: int | float,
     symbol: str,
     order_type: str,
     price: float | None = None,
@@ -1147,7 +1160,7 @@ async def create_option_symbol(
 def _build_bracket_exit_order(
     entry_order_builder: Any,
     symbol: str,
-    quantity: int,
+    quantity: int | float,
     exit_instruction: str,
     profit_price: float | None,
     loss_price: float | None,
@@ -1209,7 +1222,7 @@ async def preview_equity_order(
     ctx: SchwabContext,
     account_hash: Annotated[str, "Account hash for the Schwab account"],
     symbol: Annotated[str, "Stock symbol to trade"],
-    quantity: Annotated[int, "Number of shares to trade"],
+    quantity: Annotated[int | float, "Number of shares to trade; may be fractional"],
     instruction: Annotated[str, "BUY or SELL"],
     order_type: Annotated[str, "Order type: MARKET, LIMIT, STOP, or STOP_LIMIT"],
     price: Annotated[float | None, "Required for LIMIT; Limit price for STOP_LIMIT"] = None,
@@ -1263,7 +1276,7 @@ async def preview_equity_trailing_stop_order(
     ctx: SchwabContext,
     account_hash: Annotated[str, "Account hash for the Schwab account"],
     symbol: Annotated[str, "Stock symbol to trade"],
-    quantity: Annotated[int, "Number of shares to trade"],
+    quantity: Annotated[int | float, "Number of shares to trade; may be fractional"],
     instruction: Annotated[str, "BUY or SELL"],
     trail_offset: Annotated[
         float,
@@ -1382,7 +1395,7 @@ async def preview_bracket_order(
     ctx: SchwabContext,
     account_hash: Annotated[str, "Account hash for the Schwab account"],
     symbol: Annotated[str, "Stock symbol to trade"],
-    quantity: Annotated[int, "Number of shares to trade"],
+    quantity: Annotated[int | float, "Number of shares to trade; may be fractional"],
     entry_instruction: Annotated[str, "BUY or SELL for the entry order"],
     entry_type: Annotated[str, "Entry order type: MARKET, LIMIT, STOP, or STOP_LIMIT"],
     profit_price: Annotated[float | None, "Take-profit limit price (optional if loss_price provided)"] = None,

@@ -41,7 +41,7 @@ class NestedOrdersClient:
 
 class OrderDescription(TypedDict):
     symbol: str
-    quantity: int
+    quantity: int | float
     instruction: str
     order_type: str
     price: NotRequired[float]
